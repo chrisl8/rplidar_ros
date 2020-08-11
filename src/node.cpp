@@ -44,11 +44,16 @@
 #define DEG2RAD(x) ((x)*M_PI/180.)
 
 using namespace rp::standalone::rplidar;
+constexpr auto MAX_SAMPLE_COUNT = 360 * 8;
+constexpr float DEFAULT_FREQUENCY = 10.0; // hz
+
+using ResponseNodeArray = std::array<rplidar_response_measurement_node_hq_t, MAX_SAMPLE_COUNT>;
 
 RPlidarDriver * drv = NULL;
 
+
 void publish_scan(ros::Publisher *pub,
-                  rplidar_response_measurement_node_hq_t *nodes,
+                  const ResponseNodeArray& nodes,
                   size_t node_count, ros::Time start,
                   double scan_time, bool inverted,
                   float angle_min, float angle_max,
@@ -62,8 +67,11 @@ void publish_scan(ros::Publisher *pub,
     scan_msg.header.frame_id = frame_id;
     scan_count++;
 
+    // TODO: Why would this not be 100% consistent all of the time for a given piece of hardware?
+    //       Why do we have to check every time?
     bool reversed = (angle_max > angle_min);
     if ( reversed ) {
+      /* NOTE(allenh1): the other case seems impossible? */
       scan_msg.angle_min =  M_PI - angle_max;
       scan_msg.angle_max =  M_PI - angle_min;
     } else {
@@ -81,9 +89,14 @@ void publish_scan(ros::Publisher *pub,
     scan_msg.intensities.resize(node_count);
     scan_msg.ranges.resize(node_count);
     bool reverse_data = (!inverted && reversed) || (inverted && !reversed);
+    // TODO: "inverted" may correct the incorrect sweep direction that affects Slam Toolbox negatively,
+    //  but it will "flip" the view 180 degrees on the X? axis.
+    //  See RPLidarInversionResult.jpg
     if (!reverse_data) {
         for (size_t i = 0; i < node_count; i++) {
             float read_value = (float) nodes[i].dist_mm_q2/4.0f/1000;
+            // TODO: This will clearly demonstrate the sweep start, end, and direction.
+//            read_value = scan_msg.range_min + (0.001 * i);
             if (read_value == 0.0)
                 scan_msg.ranges[i] = std::numeric_limits<float>::infinity();
             else
@@ -93,6 +106,8 @@ void publish_scan(ros::Publisher *pub,
     } else {
         for (size_t i = 0; i < node_count; i++) {
             float read_value = (float)nodes[i].dist_mm_q2/4.0f/1000;
+            // TODO: This will clearly demonstrate the sweep start, end, and direction.
+//            read_value = scan_msg.range_min + (0.001 * i);
             if (read_value == 0.0)
                 scan_msg.ranges[node_count-1-i] = std::numeric_limits<float>::infinity();
             else
@@ -179,6 +194,7 @@ bool start_motor(std_srvs::Empty::Request &req,
 
 static float getAngle(const rplidar_response_measurement_node_hq_t& node)
 {
+    // TODO: What do these numbers mean?
     return node.angle_z_q14 * 90.f / 16384.f;
 }
 
@@ -209,7 +225,7 @@ int main(int argc, char * argv[]) {
     nh_private.param<bool>("angle_compensate", angle_compensate, false);
     nh_private.param<std::string>("scan_mode", scan_mode, std::string());
 
-    ROS_INFO("RPLIDAR running on ROS package rplidar_ros. SDK Version:"RPLIDAR_SDK_VERSION"");
+    ROS_INFO("RPLIDAR running on ROS package rplidar_ros. SDK Version:" RPLIDAR_SDK_VERSION"");
 
     u_result     op_result;
 
@@ -262,6 +278,7 @@ int main(int argc, char * argv[]) {
 
     drv->startMotor();
 
+    // TODO: This is in the set_scan_mode() function in RPLidarNode.cpp
     RplidarScanMode current_scan_mode;
     if (scan_mode.empty()) {
         op_result = drv->startScan(false /* not force scan */, true /* use typical scan mode */, 0, &current_scan_mode);
@@ -298,6 +315,22 @@ int main(int argc, char * argv[]) {
         if(angle_compensate_multiple < 1) 
           angle_compensate_multiple = 1;
         max_distance = current_scan_mode.max_distance;
+
+        std::cout << "angle_compensate_multiple: " << angle_compensate_multiple << "\n";
+        std::cout << "max_distance: " << max_distance << "\n";
+
+        const float samples_per_microsecond = 1 / current_scan_mode.us_per_sample;
+        const float samples_per_second = 1e6 * samples_per_microsecond;
+        const float samples_per_rotation = samples_per_second / DEFAULT_FREQUENCY; // Each rotation is 1000 ms
+        const float samples_per_degree = samples_per_rotation / 360.0f;
+
+        angle_compensate_multiple = samples_per_degree; // minimum viable theoretical samples per degrees rotated
+        angle_compensate_multiple = fmax(angle_compensate_multiple, 1.0f); // minimum of 1 sample per degree
+        max_distance = current_scan_mode.max_distance;
+
+        std::cout << "angle_compensate_multiple: " << angle_compensate_multiple << "\n";
+        std::cout << "max_distance: " << max_distance << "\n";
+
         ROS_INFO("current scan mode: %s, max_distance: %.1f m, Point number: %.1fK , angle_compensate: %d",  current_scan_mode.scan_mode,
                  current_scan_mode.max_distance, (1000/current_scan_mode.us_per_sample), angle_compensate_multiple);
     }
@@ -305,74 +338,94 @@ int main(int argc, char * argv[]) {
     {
         ROS_ERROR("Can not start scan: %08x!", op_result);
     }
+    // TODO: End set_scan_mode() function.
 
     ros::Time start_scan_time;
-    ros::Time end_scan_time;
     double scan_duration;
+    float angle_min;
+    float angle_max;
+
+
+    // TODO: This is the publish_loop() function in RPLidarNode.cpp
+    // TODO: This is the part that actually matters!
+    //       along with the publisher function called within
     while (ros::ok()) {
-        rplidar_response_measurement_node_hq_t nodes[360*8];
-        size_t   count = _countof(nodes);
+        ResponseNodeArray sample_nodes{};
 
         start_scan_time = ros::Time::now();
-        op_result = drv->grabScanDataHq(nodes, count);
-        end_scan_time = ros::Time::now();
-        scan_duration = (end_scan_time - start_scan_time).toSec();
+        size_t sample_count = MAX_SAMPLE_COUNT; // will get adjusted to real sample size after grabbing scan data
+        op_result = drv->grabScanDataHq(&sample_nodes[0], sample_count);
+        scan_duration = (ros::Time::now() - start_scan_time).toSec();
 
         if (op_result == RESULT_OK) {
-            op_result = drv->ascendScanData(nodes, count);
-            float angle_min = DEG2RAD(0.0f);
-            float angle_max = DEG2RAD(359.0f);
+            op_result = drv->ascendScanData(&sample_nodes[0], sample_count);
+
+            angle_min = DEG2RAD(0.0f);
+            angle_max = DEG2RAD(359.0f);
             if (op_result == RESULT_OK) {
+                constexpr auto is_valid_node = [](const auto& node) -> bool { return node.dist_mm_q2 != 0; };
+
+                const auto end_node = std::find_if(sample_nodes.rbegin(), sample_nodes.rend(), is_valid_node);
+                const auto start_node = std::find_if(sample_nodes.begin(), sample_nodes.end(), is_valid_node);
+
+                angle_min = DEG2RAD(getAngle(*start_node));
+                angle_max = DEG2RAD(getAngle(*end_node));
+
+                /**
+                 * turn this -> [0, 0, 0, 1, 2, 3, 0, 0]
+                 * into this -> [1, 2, 3, 0, 0, 0, 0, 0]
+                 */
+                std::rotate(sample_nodes.begin(), start_node, end_node.base());
+                const size_t nodes_count = end_node.base() - start_node + 1;
+
                 if (angle_compensate) {
                     //const int angle_compensate_multiple = 1;
-                    const int angle_compensate_nodes_count = 360*angle_compensate_multiple;
-                    int angle_compensate_offset = 0;
-                    rplidar_response_measurement_node_hq_t angle_compensate_nodes[angle_compensate_nodes_count];
-                    memset(angle_compensate_nodes, 0, angle_compensate_nodes_count*sizeof(rplidar_response_measurement_node_hq_t));
+                    // TODO: This is it right here, we get 360 * the angle_compensate_multiple,
+                    //       but 360 * 4 is 1440, not 1439
+                    //       UNLESS: the angle min/max are fixed in other code?
+                    const size_t angle_compensate_nodes_count = 360 * angle_compensate_multiple;
+                    ResponseNodeArray angle_compensate_nodes{};
 
-                    int i = 0, j = 0;
-                    for( ; i < count; i++ ) {
-                        if (nodes[i].dist_mm_q2 != 0) {
-                            float angle = getAngle(nodes[i]);
-                            int angle_value = (int)(angle * angle_compensate_multiple);
-                            if ((angle_value - angle_compensate_offset) < 0) angle_compensate_offset = angle_value;
-                            for (j = 0; j < angle_compensate_multiple; j++) {
-
-                                int angle_compensate_nodes_index = angle_value-angle_compensate_offset+j;
-                                if(angle_compensate_nodes_index >= angle_compensate_nodes_count)
-                                    angle_compensate_nodes_index = angle_compensate_nodes_count-1;
-                                angle_compensate_nodes[angle_compensate_nodes_index] = nodes[i];
-                            }
-                        }
+                    float angle_compensation_position = 0;
+                    float angle_compensation_delta = static_cast<double>(nodes_count) / angle_compensate_nodes_count;
+                    for (size_t index = 0; index < angle_compensate_nodes_count; ++index) {
+                        angle_compensate_nodes[index] = sample_nodes[static_cast<size_t>(angle_compensation_position)];
+//                        RCLCPP_DEBUG(logger, "%f", getAngleInDegrees(angle_compensate_nodes[index]));
+                        angle_compensation_position += angle_compensation_delta;
                     }
-  
+
+//                    std::cout << "angle_compensate_nodes_count: " << angle_compensate_nodes_count << "\n";
+//                    std::cout << "angle_min: " << angle_min << "\n";
+//                    std::cout << "angle_max: " << angle_max << "\n";
+
                     publish_scan(&scan_pub, angle_compensate_nodes, angle_compensate_nodes_count,
-                             start_scan_time, scan_duration, inverted,
-                             angle_min, angle_max, max_distance,
-                             frame_id);
-                } else {
-                    int start_node = 0, end_node = 0;
-                    int i = 0;
-                    // find the first valid node and last valid node
-                    while (nodes[i++].dist_mm_q2 == 0);
-                    start_node = i-1;
-                    i = count -1;
-                    while (nodes[i--].dist_mm_q2 == 0);
-                    end_node = i+1;
+                                 start_scan_time, scan_duration, inverted,
+                                 angle_min, angle_max, max_distance,
+                                 frame_id);
 
-                    angle_min = DEG2RAD(getAngle(nodes[start_node]));
-                    angle_max = DEG2RAD(getAngle(nodes[end_node]));
-
-                    publish_scan(&scan_pub, &nodes[start_node], end_node-start_node +1,
-                             start_scan_time, scan_duration, inverted,
-                             angle_min, angle_max, max_distance,
-                             frame_id);
+                    //                } else {
+//                    int start_node = 0, end_node = 0;
+//                    int i = 0;
+//                    // find the first valid node and last valid node
+//                    while (sample_nodes[i++].dist_mm_q2 == 0);
+//                    start_node = i-1;
+//                    i = sample_count -1;
+//                    while (sample_nodes[i--].dist_mm_q2 == 0);
+//                    end_node = i+1;
+//
+//                    angle_min = DEG2RAD(getAngle(sample_nodes[start_node]));
+//                    angle_max = DEG2RAD(getAngle(sample_nodes[end_node]));
+//
+//                    publish_scan(&scan_pub, &sample_nodes[start_node], end_node-start_node +1,
+//                             start_scan_time, scan_duration, inverted,
+//                             angle_min, angle_max, max_distance,
+//                             frame_id);
                }
             } else if (op_result == RESULT_OPERATION_FAIL) {
                 // All the data is invalid, just publish them
                 float angle_min = DEG2RAD(0.0f);
                 float angle_max = DEG2RAD(359.0f);
-                publish_scan(&scan_pub, nodes, count,
+                publish_scan(&scan_pub, sample_nodes, sample_count,
                              start_scan_time, scan_duration, inverted,
                              angle_min, angle_max, max_distance,
                              frame_id);
